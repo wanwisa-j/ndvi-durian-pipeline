@@ -8,7 +8,10 @@
 polygon input (.parquet / .gpkg)
         │
         ▼
-[Step 3] grid_point.py          ← สร้าง grid points 10m (รันครั้งเดียว)
+[Step 2] docker compose build   ← build image ครั้งเดียว
+        │
+        ▼
+[Step 3] grid_point.py (ใน Docker)  ← สร้าง grid points 10m
         │
         ▼
 data/grid_points/<PROVINCE>.parquet
@@ -31,8 +34,6 @@ output/<province>/
 | สิ่งที่ต้องการ | หมายเหตุ |
 |---|---|
 | Docker Engine ≥ 24 + Docker Compose plugin | `docker compose` (ไม่ใช่ `docker-compose`) |
-| Python 3.10+ | สำหรับ `grid_point.py` เท่านั้น รันนอก Docker |
-| `geopandas`, `shapely`, `numpy` | `pip install geopandas shapely numpy` |
 | ไฟล์ polygon ของพื้นที่ (.parquet หรือ .gpkg) | geometry column เป็น Polygon/MultiPolygon |
 | เข้าถึง `/fs2/sentinel2/tiles` หรือ `/fs7/sentinel2/tiles` | Sentinel-2 tile data |
 | RAM ≥ 16 GB | แนะนำ ≥ 64 GB สำหรับ N_JOBS=8 |
@@ -45,7 +46,7 @@ output/<province>/
 ### Step 1 — Clone repo
 
 ```bash
-git clone <repo-url> ndvi-pipeline
+git clone https://github.com/wanwisa-j/ndvi-durian-pipeline ndvi-pipeline
 cd ndvi-pipeline
 ```
 
@@ -87,26 +88,30 @@ ndvi-pipeline/
 
 `grid_point.py` สร้าง point grid 10m aligned กับ Sentinel-2 pixels สำหรับแต่ละ polygon
 
-**ติดตั้ง dependencies:**
-
-```bash
-pip install geopandas shapely numpy
-```
+Docker image มี `geopandas`, `shapely`, `numpy` ครบอยู่แล้ว ไม่ต้องติดตั้งอะไรเพิ่มบน host
 
 **รัน:**
 
 ```bash
-python3 grid_point.py \
-  --polygon-dir /path/to/your/polygons \
-  --grid-dir    /path/to/output/grid_points
+docker run --rm \
+  -v $(pwd):/workspaces \
+  -v /fs2:/workspaces/fs2 \
+  ndvi-pipeline:latest \
+  python3 /workspaces/grid_point.py \
+    --polygon-dir /workspaces/fs2/mydata/durian_polygons \
+    --grid-dir    /workspaces/fs2/mydata/durian_grid_points
 ```
 
-ตัวอย่าง:
+ตัวอย่างถ้า polygon อยู่ที่ `/fs2/mydata/polygons/` และต้องการ output ที่ `/fs2/mydata/grid_points/`:
 
 ```bash
-python3 grid_point.py \
-  --polygon-dir /fs2/mydata/durian_polygons \
-  --grid-dir    /fs2/mydata/durian_grid_points
+docker run --rm \
+  -v $(pwd):/workspaces \
+  -v /fs2:/workspaces/fs2 \
+  ndvi-pipeline:latest \
+  python3 /workspaces/grid_point.py \
+    --polygon-dir /workspaces/fs2/mydata/polygons \
+    --grid-dir    /workspaces/fs2/mydata/grid_points
 ```
 
 Output จะเป็น `.parquet` ใน `--grid-dir` ชื่อตาม stem ของ input file (uppercase):
