@@ -8,13 +8,16 @@
 polygon input (.parquet / .gpkg)
         │
         ▼
-[Step 2] docker compose build   ← build image ครั้งเดียว
+[Step 2] docker compose build        ← build image ครั้งเดียว
         │
         ▼
-[Step 3] grid_point.py (ใน Docker)  ← สร้าง grid points 10m
+[Step 3] grid_point.py (ใน Docker)   ← สร้าง grid points 10m
         │
         ▼
 data/grid_points/<PROVINCE>.parquet
+        │
+        ▼
+[Step 4] ตั้งค่า env file
         │
         ▼
 [Step 5-6] ndvi_pipeline.py (ใน Docker)
@@ -69,28 +72,29 @@ ndvi-pipeline/
 
 ---
 
-### Step 2 — เตรียม polygon file
+### Step 2 — Build Docker image
 
-ต้องการไฟล์ polygon ของพื้นที่ที่ต้องการคำนวณ NDVI
+ครั้งแรกจะนานประมาณ **15–30 นาที** (compile GDAL จาก source)
 
-**รูปแบบที่รองรับ:**
-- `.parquet` (GeoParquet)
-- `.gpkg` (GeoPackage)
+```bash
+docker compose build
+# หรือ
+./run.sh build
+```
 
-**ข้อกำหนด:**
-- geometry column ต้องเป็น **Polygon** หรือ **MultiPolygon**
-- มี column `plot_id` ถ้าไม่มีจะ auto-generate เป็น sequential 0, 1, 2, ...
-- CRS ใดก็ได้ script จะแปลงเป็น EPSG:32647 อัตโนมัติ
+ตรวจสอบ:
+
+```bash
+docker images | grep ndvi-pipeline
+# ควรเห็น ndvi-pipeline:latest
+```
 
 ---
 
 ### Step 3 — สร้าง grid points (รันครั้งเดียวต่อ polygon file)
 
 `grid_point.py` สร้าง point grid 10m aligned กับ Sentinel-2 pixels สำหรับแต่ละ polygon
-
-Docker image มี `geopandas`, `shapely`, `numpy` ครบอยู่แล้ว ไม่ต้องติดตั้งอะไรเพิ่มบน host
-
-**รัน:**
+Docker image มี `geopandas`, `shapely`, `numpy` ครบ ไม่ต้องติดตั้งอะไรเพิ่มบน host
 
 ```bash
 docker run --rm \
@@ -100,18 +104,6 @@ docker run --rm \
   python3 /workspaces/grid_point.py \
     --polygon-dir /workspaces/fs2/mydata/durian_polygons \
     --grid-dir    /workspaces/fs2/mydata/durian_grid_points
-```
-
-ตัวอย่างถ้า polygon อยู่ที่ `/fs2/mydata/polygons/` และต้องการ output ที่ `/fs2/mydata/grid_points/`:
-
-```bash
-docker run --rm \
-  -v $(pwd):/workspaces \
-  -v /fs2:/workspaces/fs2 \
-  ndvi-pipeline:latest \
-  python3 /workspaces/grid_point.py \
-    --polygon-dir /workspaces/fs2/mydata/polygons \
-    --grid-dir    /workspaces/fs2/mydata/grid_points
 ```
 
 Output จะเป็น `.parquet` ใน `--grid-dir` ชื่อตาม stem ของ input file (uppercase):
@@ -129,7 +121,20 @@ Pipeline จะ auto-discover grid file โดย match stem กับ `GOLDEN_D
 
 ---
 
-### Step 4 — สร้าง env file สำหรับแต่ละจังหวัด
+### Step 4 — เตรียม polygon file และสร้าง env file
+
+ต้องการไฟล์ polygon ของพื้นที่ที่ต้องการคำนวณ NDVI
+
+**รูปแบบที่รองรับ:**
+- `.parquet` (GeoParquet)
+- `.gpkg` (GeoPackage)
+
+**ข้อกำหนด:**
+- geometry column ต้องเป็น **Polygon** หรือ **MultiPolygon**
+- มี column `plot_id` ถ้าไม่มีจะ auto-generate เป็น sequential 0, 1, 2, ...
+- CRS ใดก็ได้ script จะแปลงเป็น EPSG:32647 อัตโนมัติ
+
+สร้าง env file สำหรับแต่ละจังหวัด:
 
 ```bash
 cp envs/chanthaburi.env envs/<province>.env
@@ -149,26 +154,7 @@ OUTPUT_DIR=/fs2/mydata/ndvi_output
 
 ---
 
-### Step 5 — Build Docker image
-
-ครั้งแรกจะนานประมาณ **15–30 นาที** (compile GDAL จาก source)
-
-```bash
-docker compose build
-# หรือ
-./run.sh build
-```
-
-ตรวจสอบ:
-
-```bash
-docker images | grep ndvi-pipeline
-# ควรเห็น ndvi-pipeline:latest
-```
-
----
-
-### Step 6 — รัน Pipeline
+### Step 5 — รัน Pipeline
 
 ```bash
 ./run.sh run <province>
@@ -187,7 +173,7 @@ docker compose --env-file envs/rayong.env logs -f
 
 ---
 
-### Step 7 — ติดตาม progress
+### Step 6 — ติดตาม progress
 
 ```bash
 # ดู log real-time
