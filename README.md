@@ -1,84 +1,160 @@
-# NDVI Pipeline — วิธี Setup บน Server ใหม่
+# NDVI Pipeline — ทุเรียน
 
-## สิ่งที่ต้องมีก่อน
+คำนวณ NDVI รายเดือนจาก Sentinel-2 สำหรับ polygon พื้นที่ปลูกทุเรียน รันผ่าน Docker
 
-- Docker Engine ≥ 24
-- Docker Compose plugin (`docker compose` ไม่ใช่ `docker-compose`)
-- RAM ≥ 30 GB (แนะนำ ≥ 64 GB สำหรับ N_JOBS=8)
-- พื้นที่ disk ≥ 20 GB สำหรับ image
+## ภาพรวม workflow
+
+```
+polygon input (.parquet / .gpkg)
+        │
+        ▼
+[Step 3] grid_point.py          ← สร้าง grid points 10m (รันครั้งเดียว)
+        │
+        ▼
+data/grid_points/<PROVINCE>.parquet
+        │
+        ▼
+[Step 5-6] ndvi_pipeline.py (ใน Docker)
+        │
+        ▼
+output/<province>/
+  ├── ndvi_mean.parquet
+  ├── ndvi_max.parquet
+  ├── ndvi_min.parquet
+  └── ndvi_median.parquet
+```
 
 ---
 
-## 1. Clone / copy โค้ดลง server
+## สิ่งที่ต้องมีก่อนเริ่ม
+
+| สิ่งที่ต้องการ | หมายเหตุ |
+|---|---|
+| Docker Engine ≥ 24 + Docker Compose plugin | `docker compose` (ไม่ใช่ `docker-compose`) |
+| Python 3.10+ | สำหรับ `grid_point.py` เท่านั้น รันนอก Docker |
+| `geopandas`, `shapely`, `numpy` | `pip install geopandas shapely numpy` |
+| ไฟล์ polygon ของพื้นที่ (.parquet หรือ .gpkg) | geometry column เป็น Polygon/MultiPolygon |
+| เข้าถึง `/fs2/sentinel2/tiles` หรือ `/fs7/sentinel2/tiles` | Sentinel-2 tile data |
+| RAM ≥ 16 GB | แนะนำ ≥ 64 GB สำหรับ N_JOBS=8 |
+| พื้นที่ disk ≥ 20 GB | สำหรับ Docker image |
+
+---
+
+## ขั้นตอน
+
+### Step 1 — Clone repo
 
 ```bash
-# ถ้าใช้ git
 git clone <repo-url> ndvi-pipeline
 cd ndvi-pipeline
-
-# หรือ scp จากเครื่องตัวเอง
-scp -r ./ndvi-pipeline user@server:/home/user/ndvi-pipeline
-ssh user@server
-cd /home/user/ndvi-pipeline
 ```
 
-ตรวจสอบว่าไฟล์ครบ:
+โครงสร้างไฟล์หลัง clone:
 
 ```
 ndvi-pipeline/
+├── grid_point.py          ← สร้าง grid points จาก polygon
+├── ndvi_pipeline.py       ← pipeline หลัก (รันใน Docker)
 ├── Dockerfile
-├── docker-compose.yml
-├── ndvi_pipeline.py
-├── requirements.txt
+├── docker-compose.yaml
 ├── run.sh
+├── requirements.txt
+├── geodata/
+│   └── thailand_bbox.gpkg
 └── envs/
-    ├── chanthaburi.env
-    └── rayong.env        ← สร้างตาม template ด้านล่าง
+    ├── chanthaburi.env    ← ตัวอย่าง env (ต้องแก้ path)
+    └── rayong.env
 ```
 
 ---
 
-## 2. สร้าง env file สำหรับแต่ละจังหวัด
+### Step 2 — เตรียม polygon file
 
-สร้างโฟลเดอร์ `envs/` แล้วสร้างไฟล์ per-province:
+ต้องการไฟล์ polygon ของพื้นที่ที่ต้องการคำนวณ NDVI
+
+**รูปแบบที่รองรับ:**
+- `.parquet` (GeoParquet)
+- `.gpkg` (GeoPackage)
+
+**ข้อกำหนด:**
+- geometry column ต้องเป็น **Polygon** หรือ **MultiPolygon**
+- มี column `plot_id` ถ้าไม่มีจะ auto-generate เป็น sequential 0, 1, 2, ...
+- CRS ใดก็ได้ script จะแปลงเป็น EPSG:32647 อัตโนมัติ
+
+---
+
+### Step 3 — สร้าง grid points (รันครั้งเดียวต่อ polygon file)
+
+`grid_point.py` สร้าง point grid 10m aligned กับ Sentinel-2 pixels สำหรับแต่ละ polygon
+
+**ติดตั้ง dependencies:**
 
 ```bash
-mkdir -p envs
+pip install geopandas shapely numpy
 ```
 
-**ตัวอย่าง `envs/rayong.env`:**
+**รัน:**
 
-```env
-# --- Required ---
-PROVINCE=rayong
-GOLDEN_DURIAN_PATH=/fs2/wanwisa/durian/input/rayong.parquet
-OUTPUT_DIR=/fs2/wanwisa/durian/output/ndvi
-
-# --- Optional (ถ้าไม่ใส่จะใช้ default) ---
-SENTINEL2_TILE_PATH=/fs2/angkanap/00_MAP_TH/03_SENTINEL-2_TILES/sentinel_2_index_shapefile.shp
-S2_FOLDER=/fs2/sentinel2/tiles
-TREE=segment
-YEAR_START=2019
-YEAR_END=2026
-BAND1=08
-BAND2=04
-N_JOBS=8
-MAX_RAM_GB=100
+```bash
+python3 grid_point.py \
+  --polygon-dir /path/to/your/polygons \
+  --grid-dir    /path/to/output/grid_points
 ```
 
-> **หมายเหตุ:** คัดลอก template นี้แล้วเปลี่ยนแค่ `PROVINCE`, `GOLDEN_DURIAN_PATH`, `OUTPUT_DIR`
+ตัวอย่าง:
+
+```bash
+python3 grid_point.py \
+  --polygon-dir /fs2/mydata/durian_polygons \
+  --grid-dir    /fs2/mydata/durian_grid_points
+```
+
+Output จะเป็น `.parquet` ใน `--grid-dir` ชื่อตาม stem ของ input file (uppercase):
+
+```
+polygons/
+  RAYONG_durian.parquet  →  grid_points/RAYONG_DURIAN.parquet
+  trat.gpkg              →  grid_points/TRAT.parquet
+```
+
+Pipeline จะ auto-discover grid file โดย match stem กับ `GOLDEN_DURIAN_PATH`
+หรือตั้ง `GRID_POINTS_DIR` ใน env file ให้ชี้ตรงๆ ก็ได้
+
+> รัน `--overwrite` เพื่อ rebuild ถ้า polygon เปลี่ยน
 
 ---
 
-## 3. Build Docker image
+### Step 4 — สร้าง env file สำหรับแต่ละจังหวัด
 
-ครั้งแรกจะนานประมาณ **15–30 นาที** เพราะต้อง compile GDAL จาก source
+```bash
+cp envs/chanthaburi.env envs/<province>.env
+```
+
+แก้ไข 3 ค่าที่ **จำเป็น**:
+
+```env
+PROVINCE=rayong
+GOLDEN_DURIAN_PATH=/fs2/mydata/durian_polygons/RAYONG_durian.parquet
+OUTPUT_DIR=/fs2/mydata/ndvi_output
+```
+
+ดู [ตาราง env vars ทั้งหมด](#env-vars) ด้านล่าง
+
+> **path ใน `envs/*.env` hardcode ไว้กับเครื่องนี้** — ต้องแก้ให้ตรงกับ path ของคุณเสมอ
+
+---
+
+### Step 5 — Build Docker image
+
+ครั้งแรกจะนานประมาณ **15–30 นาที** (compile GDAL จาก source)
 
 ```bash
 docker compose build
+# หรือ
+./run.sh build
 ```
 
-ตรวจสอบว่า build สำเร็จ:
+ตรวจสอบ:
 
 ```bash
 docker images | grep ndvi-pipeline
@@ -87,9 +163,17 @@ docker images | grep ndvi-pipeline
 
 ---
 
-## 4. รัน Pipeline
+### Step 6 — รัน Pipeline
 
-### ใช้ docker compose
+```bash
+./run.sh run <province>
+
+# ตัวอย่าง
+./run.sh run rayong
+./run.sh run chanthaburi
+```
+
+หรือใช้ docker compose โดยตรง:
 
 ```bash
 docker compose --env-file envs/rayong.env up -d
@@ -98,70 +182,87 @@ docker compose --env-file envs/rayong.env logs -f
 
 ---
 
-## 5. Debug / ตรวจสอบปัญหา
+### Step 7 — ติดตาม progress
 
-### เปิด shell เข้าไปใน container
+```bash
+# ดู log real-time
+./run.sh tail <province>
+
+# ดูสถานะ container ทั้งหมด
+./run.sh status
+
+# เปิด shell เข้าใน container (debug)
+./run.sh shell <province>
+
+# หยุด container
+./run.sh stop <province>
+```
+
+ทดสอบ GDAL ใน container:
 
 ```bash
 ./run.sh shell rayong
-```
-
-จากนั้นทดสอบ GDAL:
-
-```bash
 python3 -c "from osgeo import gdal; print('GDAL OK:', gdal.VersionInfo())"
-```
-
-ทดสอบ env vars:
-
-```bash
 env | grep -E "PROVINCE|GOLDEN|OUTPUT|S2_FOLDER"
-```
-
-### ดู log ย้อนหลัง
-
-Log จะอยู่ที่ `$OUTPUT_DIR/<province>/logs/ndvi_<province>_<timestamp>.log`
-
-```bash
-# ดู log ล่าสุด
-./run.sh tail rayong
-
-# หรือดูตรงๆ
-ls /fs2/wanwisa/durian/output/ndvi/rayong/logs/
-tail -f /fs2/wanwisa/durian/output/ndvi/rayong/logs/ndvi_rayong_*.log
-```
-
-### ดู memory ขณะรัน
-
-```bash
-docker stats ndvi_rayong
 ```
 
 ---
 
-## 6. โครงสร้าง Output
+## โครงสร้าง Output
 
 ```
 $OUTPUT_DIR/
 └── <province>/
-    ├── logs/
-    │   └── ndvi_<province>_<YYYYMMDD_HHMMSS>.log
-    └── <province>_segment_ndvi_<tile>_<polygon_idx>.parquet
+    ├── point_master.parquet     ← grid point ทั้งหมด (WGS84)
+    ├── ndvi_mean.parquet        ← NDVI เฉลี่ยรายเดือน
+    ├── ndvi_max.parquet
+    ├── ndvi_min.parquet
+    ├── ndvi_median.parquet
+    ├── performance_summary.json ← สถิติ runtime
+    └── logs/
+        └── ndvi_<province>_<YYYYMMDD_HHMMSS>.log
 ```
 
-แต่ละ parquet จะมี columns:
-- `x`, `y` —좌표 EPSG ของ tile นั้น
-- `geometry` — Point geometry
-- `YYYY/MM/DD` — NDVI value (float32) ของแต่ละวันที่มีภาพ
+**Columns ใน `ndvi_*.parquet`:**
+
+| Column | คำอธิบาย |
+|--------|----------|
+| `plot_id` | index ของ polygon ใน input (0-based) |
+| `point_id` | index ของ point ภายใน polygon |
+| `lat`, `lon` | พิกัด WGS84 |
+| `geometry` | Point geometry (WGS84) |
+| `YYYY-MM` | NDVI monthly value (float32, `NaN` = ไม่มีภาพใสพอในเดือนนั้น) |
+
+---
+
+## Env vars
+
+| Variable | Default | Required | คำอธิบาย |
+|---|---|---|---|
+| `PROVINCE` | — | ✓ | ชื่อจังหวัด (lowercase) |
+| `GOLDEN_DURIAN_PATH` | — | ✓ | path ของ polygon input |
+| `OUTPUT_DIR` | — | ✓ | directory สำหรับ output |
+| `GRID_POINTS_DIR` | auto | — | path ของโฟลเดอร์ grid parquet (auto-discover ถ้าไม่ระบุ) |
+| `SENTINEL2_TILE_PATH` | `/fs2/angkanap/.../sentinel_2_index_shapefile.shp` | — | S2 tile grid shapefile |
+| `S2_FOLDER_NEW` | `/fs2/sentinel2/tiles` | — | Sentinel-2 scenes หลัง 2025-07-01 |
+| `S2_FOLDER_OLD` | `/fs7/sentinel2/tiles` | — | Sentinel-2 scenes ก่อน 2025-07-01 |
+| `S2_FOLDER_CUTOFF` | `2025-07-01` | — | วันตัดระหว่าง OLD/NEW folder |
+| `YEAR_START` | `2019` | — | ปีเริ่มต้น |
+| `YEAR_END` | `2026` | — | ปีสิ้นสุด |
+| `N_JOBS` | `auto` | — | จำนวน parallel worker (`auto` = คำนวณจาก RAM อัตโนมัติ) |
+| `MAX_RAM_GB` | `100` | — | RAM budget (GB) |
+| `FORCE_REBUILD_POINTS` | `0` | — | ตั้งเป็น `1` เพื่อ rebuild `point_master.parquet` |
 
 ---
 
 ## Troubleshooting
 
-| อาการ | สาเหตุที่เป็นไปได้ | วิธีแก้ |
+| อาการ | สาเหตุ | วิธีแก้ |
 |---|---|---|
-| `EnvironmentError: 'PROVINCE' is required` | ไม่ได้ส่ง env file | ใช้ `--env-file envs/<province>.env` หรือ `./run.sh run <province>` |
-| `GDAL OK` ไม่ขึ้น | venv path ผิด | ตรวจ `PYTHONPATH` ใน container |
-| Memory guard รอนาน | RAM เต็ม | ลด `N_JOBS` หรือเพิ่ม `MAX_RAM_GB` |
-| `no imagery found` | path `/fs2` ไม่ได้ mount | ตรวจ volumes ใน compose / run.sh |
+| `PROVINCE GRID NOT FOUND` | ยังไม่ได้รัน grid_point.py หรือ output path ผิด | รัน Step 3 และตั้ง `GRID_POINTS_DIR` ใน env ให้ชี้ตรงๆ |
+| `'PROVINCE' is required` | ไม่ได้ส่ง env file | ใช้ `./run.sh run <province>` หรือ `--env-file envs/<province>.env` |
+| `GDAL OK` ไม่ขึ้น | venv path ผิดใน container | ตรวจ `PYTHONPATH` ใน Dockerfile |
+| Memory guard รอนานมาก | RAM ไม่เพียงพอ | ลด `N_JOBS` หรือเพิ่ม `MAX_RAM_GB` |
+| `no imagery found` | S2 path ผิด หรือ `/fs` ไม่ได้ mount | ตรวจ `S2_FOLDER_NEW`/`OLD` และ volumes ใน docker-compose.yaml |
 | Build นานมาก (>45 min) | compile GDAL ซ้ำ | ใช้ `docker build --cache-from` หรือ pull image จาก registry |
+| output ไม่ครบ 4 ไฟล์ | pipeline exit ก่อนครบ | ดู log ด้วย `./run.sh tail <province>` หาบรรทัด `ERROR` |
