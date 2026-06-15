@@ -1,0 +1,80 @@
+# =============================================================================
+# NDVI Pipeline — docker-compose
+#
+# Usage (ระบุ env file ต่อจังหวัด):
+#   docker compose --env-file envs/chanthaburi.env up
+#   docker compose --env-file envs/rayong.env up
+#
+# หรือ override inline:
+#   PROVINCE=rayong GOLDEN_DURIAN_PATH=/fs2/... OUTPUT_DIR=/fs2/... docker compose up
+# =============================================================================
+
+services:
+  ndvi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    image: ndvi-pipeline:latest
+    container_name: ndvi-${PROVINCE:-pipeline}
+
+    working_dir: /workspaces
+
+    environment:
+      - PROVINCE=${PROVINCE:-placeholder}
+      - GOLDEN_DURIAN_PATH=${GOLDEN_DURIAN_PATH:-placeholder}
+      - OUTPUT_DIR=${OUTPUT_DIR:-placeholder}
+
+      # --- Optional (มี default ใน script) ---
+      - SENTINEL2_TILE_PATH=${SENTINEL2_TILE_PATH:-/fs2/angkanap/00_MAP_TH/03_SENTINEL-2_TILES/sentinel_2_index_shapefile.shp}
+      - S2_FOLDER_OLD=${S2_FOLDER_OLD:-/fs7/sentinel2/tiles}
+      - S2_FOLDER_NEW=${S2_FOLDER_NEW:-/fs2/sentinel2/tiles}
+      - S2_FOLDER_CUTOFF=${S2_FOLDER_CUTOFF:-2025-07-01}
+      - TREE=${TREE:-segment}
+      - YEAR_START=${YEAR_START:-2019}
+      - YEAR_END=${YEAR_END:-2026}
+      - BAND1=${BAND1:-08}
+      - BAND2=${BAND2:-04}
+      - N_JOBS=${N_JOBS:-8}
+      - MAX_RAM_GB=${MAX_RAM_GB:-100}
+      - GRID_POINTS_DIR=${GRID_POINTS_DIR:-}
+      - FORCE_REBUILD_POINTS=${FORCE_REBUILD_POINTS:-0}
+
+      # --- Python / GDAL ---
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/opt/venv/lib/python3.11/site-packages
+      - PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin
+      - GDAL_CACHEMAX=512
+      - GDAL_NUM_THREADS=4
+      - OGR_SQLITE_SYNCHRONOUS=OFF
+
+    volumes:
+      - .:/workspaces          # source code
+      - /fs1:/workspaces/fs1
+      - /fs2:/workspaces/fs2
+      - /fs3:/workspaces/fs3
+      - /fs4:/workspaces/fs4
+      - /fs5:/workspaces/fs5
+      - /fs6:/workspaces/fs6
+      - /fs7:/workspaces/fs7
+      - /fs8:/workspaces/fs8
+
+    deploy:
+      resources:
+        limits:
+          memory: 120G
+        reservations:
+          memory: 16G
+
+    shm_size: "2gb"
+
+    stdin_open: true
+    tty: true
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+    command: python3 /workspaces/ndvi_pipeline.py

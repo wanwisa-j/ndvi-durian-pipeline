@@ -1,0 +1,17 @@
+# GDAL Python bindings — ต้องตรงกับ GDAL ที่ build ใน Dockerfile
+GDAL==3.8.5
+
+# Geospatial
+geopandas==0.14.4
+pyproj==3.6.1
+shapely==2.0.4
+
+# Raster / array
+numpy==1.26.4
+
+# Tabular / parquet
+pandas==2.2.2
+pyarrow==16.1.0
+
+# Memory monitoring
+psutil==5.9.8
