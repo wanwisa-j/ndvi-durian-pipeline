@@ -101,16 +101,17 @@ sentinel2_tile_path = _resolve_path(_env("SENTINEL2_TILE_PATH",
 s2_folder_old    = _resolve_path(_env("S2_FOLDER_OLD",    "/fs7/sentinel2/tiles"))
 s2_folder_new    = _resolve_path(_env("S2_FOLDER_NEW",    "/fs2/sentinel2/tiles"))
 s2_folder_cutoff = pd.Timestamp(_env("S2_FOLDER_CUTOFF", "2025-07-01"))
-tree                = _env("TREE", "segment")
-year_start          = int(_env("YEAR_START", 2019))
-year_end            = int(_env("YEAR_END", 2026))
-band1_name          = _env("BAND1", "08")
+tree       = _env("TREE", "segment")
+date_start = pd.Timestamp(_env("DATE_START", "2019-01-01"))
+date_end   = pd.Timestamp(_env("DATE_END",   "2026-12-31"))
+band1_name = _env("BAND1", "08")
 band2_name          = _env("BAND2", "04")
 sat                 = _env("SAT", "B")
 res                 = 10
 
 # Grid points directory (auto-discovered from GOLDEN_DURIAN_PATH if empty)
 GRID_POINTS_DIR      = _env("GRID_POINTS_DIR", "")
+GRID_POINTS_FILE     = _env("GRID_POINTS_FILE", "")
 FORCE_REBUILD_POINTS = _env("FORCE_REBUILD_POINTS", "0").lower() in ("1", "true", "yes")
 
 SOFT_RATIO       = float(_env("SOFT_RATIO", 0.92))
@@ -443,12 +444,11 @@ def get_raster_crs(raster_path: str) -> int:
     return int(srs.GetAttrValue("AUTHORITY", 1))
 
 def s2_timeseries_fullpath(
-    band_no: str, res: int, year_start: int, year_end: int,
+    band_no: str, res: int, date_start: pd.Timestamp, date_end: pd.Timestamp,
     tile_name: str, sat: str,
 ) -> pd.DataFrame:
-    tile        = f"{tile_name[0:2]}/{tile_name[2:3]}/{tile_name[3:5]}"
-    valid_years = set(range(year_start, year_end + 1))
-    log         = logging.getLogger()
+    tile = f"{tile_name[0:2]}/{tile_name[2:3]}/{tile_name[3:5]}"
+    log  = logging.getLogger()
 
     # date_str → (band_path, omni_path, folder_label); NEW overwrites OLD on dupe
     scenes: dict[str, tuple[str, str, str]] = {}
@@ -460,9 +460,6 @@ def s2_timeseries_fullpath(
         for fn in os.listdir(tile_dir):
             parts = fn.split("_")
             if len(parts) < 3:
-                continue
-            yr = parts[2][0:4]
-            if not yr.isdigit() or int(yr) not in valid_years:
                 continue
             if fn[2:3] != sat:
                 continue
@@ -476,6 +473,9 @@ def s2_timeseries_fullpath(
                 if len(bg) != 1:
                     continue
                 date_str = os.path.basename(bg[0])[7:15]
+                dt       = pd.to_datetime(date_str, format="%Y%m%d")
+                if not (date_start <= dt <= date_end):
+                    continue
                 if overwrite or date_str not in scenes:
                     scenes[date_str] = (bg[0], og[0], label)
             except Exception:
@@ -573,12 +573,17 @@ def discover_province_grid() -> str | None:
     """Find the pre-generated grid parquet for the active province.
 
     Search order:
-      1. GRID_POINTS_DIR env var (if set)
-      2. Auto: dirname(dirname(GOLDEN_DURIAN_PATH))/grid_points/
+      1. GRID_POINTS_FILE env var (specific file override)
+      2. GRID_POINTS_DIR env var (if set)
+      3. Auto: dirname(dirname(GOLDEN_DURIAN_PATH))/grid_points/
 
     Match rule: normalize both stems to uppercase, strip trailing space+digits,
     take first sorted match.
     """
+    if GRID_POINTS_FILE and os.path.isfile(GRID_POINTS_FILE):
+        logging.info("GRID FILE override: %s", GRID_POINTS_FILE)
+        return GRID_POINTS_FILE
+
     grid_dir = _resolve_path(GRID_POINTS_DIR) if GRID_POINTS_DIR else None
     if not grid_dir:
         grid_dir = os.path.join(
@@ -596,9 +601,9 @@ def discover_province_grid() -> str | None:
     for fn in sorted(os.listdir(grid_dir)):
         if not fn.endswith(".parquet"):
             continue
-        # Strip trailing " 1", " 2", etc. from grid filename stems
+        # Strip trailing " 1", " 2", etc. then strip "_GRID" suffix (new naming convention)
         fn_stem = os.path.splitext(fn)[0].upper().rstrip(" 0123456789").strip()
-        fn_stem = fn_stem.replace(" ", "_")
+        fn_stem = fn_stem.replace(" ", "_").removesuffix("_GRID")
         poly_norm = poly_stem.replace(" ", "_")
         if fn_stem == poly_norm or fn_stem.startswith(poly_norm):
             best = os.path.join(grid_dir, fn)
@@ -645,7 +650,10 @@ def load_and_validate_province_grid(grid_path: str) -> pd.DataFrame | None:
 
 def _pts_from_province_grid_for_tile(
     province_grid: pd.DataFrame,
-    tile_poly_ids: list[int],   # 0-based polygon row indices for this tile
+    tile_poly_ids: list,   # values of golden_durian["plot_id"] for this tile
+                            # (not row position -- must match province_grid["plot_id"],
+                            # which is the source polygon file's own plot_id when
+                            # present, same as grid_point.py's fallback otherwise)
     s2_epsg: int,
     tile: str,
 ) -> tuple[pd.DataFrame, int] | tuple[None, int]:
@@ -1105,8 +1113,8 @@ def main() -> None:
     log_path = setup_logging(log_dir, province)
 
     logging.info("=" * 70)
-    logging.info("NDVI Pipeline (scene-first)  province=%s  years=%d-%d",
-                 province, year_start, year_end)
+    logging.info("NDVI Pipeline (scene-first)  province=%s  dates=%s to %s",
+                 province, date_start.date(), date_end.date())
     logging.info("output_dir=%s  N_JOBS=%d  FORCE_REBUILD_POINTS=%s",
                  output_dir, N_JOBS, FORCE_REBUILD_POINTS)
     cg_lim, cg_cur      = get_cgroup_memory_gb()
@@ -1131,6 +1139,19 @@ def main() -> None:
         golden_durian = gpd.read_parquet(golden_durian_path).to_crs("EPSG:4326")
     else:
         golden_durian = gpd.read_file(golden_durian_path).to_crs("EPSG:4326")
+    golden_durian = golden_durian.reset_index(drop=True)
+    # Mirror grid_point.py's own plot_id fallback exactly: when the source
+    # polygon file already carries a plot_id column (real survey exports
+    # always do -- it's the record ID, not a 0..N-1 row position), the grid
+    # was built keyed on THOSE values, not on row position. Using
+    # joined_gdf.index below instead of this column made tile_poly_ids
+    # (0-based positions) get compared against province_grid["plot_id"]
+    # (arbitrary survey IDs) in _pts_from_province_grid_for_tile -- a type
+    # AND value mismatch that silently matched nothing ("GRID FILTER
+    # tile=...: 0 points for N polygons") for every polygon file with a
+    # pre-existing plot_id column.
+    if "plot_id" not in golden_durian.columns:
+        golden_durian["plot_id"] = np.arange(len(golden_durian))
     t_poly = time.perf_counter() - t0
     _perf.add(startup_load_polygons=t_poly)
     logging.info("STARTUP: %d polygons loaded  %.2fs", len(golden_durian), t_poly)
@@ -1191,11 +1212,11 @@ def main() -> None:
     all_tile_pts: dict[str, tuple[pd.DataFrame, int]] = {}
 
     for tile in tiles:
-        s2_b1 = s2_timeseries_fullpath(band1_name, res, year_start, year_end, tile, sat)
+        s2_b1 = s2_timeseries_fullpath(band1_name, res, date_start, date_end, tile, sat)
         if s2_b1.empty:
             continue
         s2_epsg       = get_raster_crs(s2_b1[f"b{band1_name}"].iloc[0])
-        tile_poly_ids = joined_gdf[joined_gdf["tile"] == tile].index.tolist()  # 0-based row indices
+        tile_poly_ids = joined_gdf.loc[joined_gdf["tile"] == tile, "plot_id"].tolist()
         pts, n_polys  = _pts_from_province_grid_for_tile(
             province_grid_df, tile_poly_ids, s2_epsg, tile)
         if pts is not None and not pts.empty:
@@ -1212,8 +1233,8 @@ def main() -> None:
         logging.info("TILE START: %s", tile)
         t_tile_start = time.perf_counter()
 
-        s2_b1 = s2_timeseries_fullpath(band1_name, res, year_start, year_end, tile, sat)
-        s2_b2 = s2_timeseries_fullpath(band2_name, res, year_start, year_end, tile, sat)
+        s2_b1 = s2_timeseries_fullpath(band1_name, res, date_start, date_end, tile, sat)
+        s2_b2 = s2_timeseries_fullpath(band2_name, res, date_start, date_end, tile, sat)
         if s2_b1.empty or s2_b2.empty:
             logging.warning("TILE %s: no imagery — skip", tile)
             continue

@@ -35,9 +35,21 @@ import numpy as np
 from shapely.geometry import Point
 from shapely.validation import make_valid
 
+try:
+    from shapely import contains_xy as _contains_xy
+    _FAST_CONTAINS = True
+except ImportError:
+    from shapely.prepared import prep as _prep
+    _FAST_CONTAINS = False
 
-TARGET_CRS = 32647
-SPACING    = 10
+
+SPACING = 10
+
+
+def detect_utm_epsg(gdf: gpd.GeoDataFrame) -> int:
+    """Auto-select UTM zone 47N (EPSG:32647) or 48N (EPSG:32648) from polygon centroid lon."""
+    centroid_lon = gdf.to_crs(4326).geometry.unary_union.centroid.x
+    return 32648 if centroid_lon >= 102.0 else 32647
 
 
 def snap_coord(v, spacing=10):
@@ -45,27 +57,26 @@ def snap_coord(v, spacing=10):
 
 
 def create_grid(poly, spacing=10):
+    """Return (x_array, y_array) of grid point centers inside poly (vectorized)."""
     minx, miny, maxx, maxy = poly.bounds
-    minx = snap_coord(minx, spacing)
-    miny = snap_coord(miny, spacing)
-    maxx = snap_coord(maxx, spacing)
-    maxy = snap_coord(maxy, spacing)
+    xs = np.arange(snap_coord(minx, spacing) + spacing / 2, maxx, spacing)
+    ys = np.arange(snap_coord(miny, spacing) + spacing / 2, maxy, spacing)
+    if len(xs) == 0 or len(ys) == 0:
+        return np.empty(0), np.empty(0)
 
-    xs = np.arange(minx, maxx, spacing)
-    ys = np.arange(miny, maxy, spacing)
+    xx, yy = np.meshgrid(xs, ys)
+    px = xx.ravel()
+    py = yy.ravel()
 
-    pts = []
-    for x in xs:
-        for y in ys:
-            px = x + spacing / 2
-            py = y + spacing / 2
-            p  = Point(px, py)
-            try:
-                if poly.intersects(p):
-                    pts.append(p)
-            except Exception:
-                continue
-    return pts
+    if _FAST_CONTAINS:
+        mask = _contains_xy(poly, px, py)
+    else:
+        prepared = _prep(poly)
+        mask = np.fromiter(
+            (prepared.contains(Point(x, y)) for x, y in zip(px, py)),
+            dtype=bool, count=len(px),
+        )
+    return px[mask], py[mask]
 
 
 def build_feature_id(plot_uid, x_utm, y_utm):
@@ -79,9 +90,14 @@ def load_polygon_file(polygon_path: Path) -> gpd.GeoDataFrame:
     return gpd.read_file(polygon_path)
 
 
-def process_polygon_file(polygon_path: Path, grid_dir: Path, overwrite: bool = False):
+def process_polygon_file(
+    polygon_path: Path,
+    grid_dir: Path,
+    overwrite: bool = False,
+    output_file: Path | None = None,
+):
     province    = polygon_path.stem.upper()
-    output_path = grid_dir / f"{province}.parquet"
+    output_path = output_file if output_file is not None else grid_dir / f"{polygon_path.stem}_grid.parquet"
 
     if output_path.exists() and not overwrite:
         print(f"SKIP {province} (already exists) — ใช้ --overwrite เพื่อรันใหม่")
@@ -99,10 +115,17 @@ def process_polygon_file(polygon_path: Path, grid_dir: Path, overwrite: bool = F
         print("plot_id not found -> สร้าง sequential id")
         gdf["plot_id"] = np.arange(len(gdf))
 
-    gdf = gdf.to_crs(TARGET_CRS)
+    # Fix invalid geometries BEFORE anything that needs valid input --
+    # detect_utm_epsg()'s unary_union() included. GEOS raises
+    # "TopologyException: side location conflict" on self-intersecting /
+    # otherwise invalid polygons, so validity must be fixed first, not after.
     gdf["geometry"] = gdf["geometry"].apply(make_valid)
     gdf = gdf[gdf.geometry.notnull() & ~gdf.geometry.is_empty]
     print(f"Valid polygons: {len(gdf):,}")
+
+    target_crs = detect_utm_epsg(gdf)
+    print(f"UTM zone: EPSG:{target_crs}")
+    gdf = gdf.to_crs(target_crs)
 
     all_rows     = []
     total_points = 0
@@ -110,22 +133,22 @@ def process_polygon_file(polygon_path: Path, grid_dir: Path, overwrite: bool = F
     for row in gdf.itertuples():
         plot_id  = row.plot_id
         plot_uid = f"{province}_{plot_id}"
-        pts      = create_grid(row.geometry, SPACING)
+        xs, ys = create_grid(row.geometry, SPACING)
 
-        for point_idx, p in enumerate(pts):
+        for point_idx, (px, py) in enumerate(zip(xs, ys)):
             all_rows.append({
                 "province":   province,
                 "plot_id":    plot_id,
                 "plot_uid":   plot_uid,
                 "point_id":   point_idx,
-                "feature_id": build_feature_id(plot_uid, p.x, p.y),
-                "x_utm":      p.x,
-                "y_utm":      p.y,
-                "geometry":   p,
+                "feature_id": build_feature_id(plot_uid, px, py),
+                "x_utm":      px,
+                "y_utm":      py,
+                "geometry":   Point(px, py),
             })
-        total_points += len(pts)
+        total_points += len(xs)
 
-    grid_gdf = gpd.GeoDataFrame(all_rows, crs=f"EPSG:{TARGET_CRS}")
+    grid_gdf = gpd.GeoDataFrame(all_rows, crs=f"EPSG:{target_crs}")
     print(f"Total points: {len(grid_gdf):,}")
 
     grid_wgs84       = grid_gdf.to_crs(4326)
@@ -145,9 +168,14 @@ def main():
     parser = argparse.ArgumentParser(
         description="สร้าง Sentinel-2 10m grid points จาก polygon file"
     )
-    parser.add_argument(
-        "--polygon-dir", required=True,
-        help="directory ที่มีไฟล์ polygon (.parquet หรือ .gpkg)"
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--polygon-file",
+        help="ไฟล์ polygon ไฟล์เดียว (.parquet หรือ .gpkg)",
+    )
+    source.add_argument(
+        "--polygon-dir",
+        help="directory ที่มีไฟล์ polygon (.parquet หรือ .gpkg)",
     )
     parser.add_argument(
         "--grid-dir", required=True,
@@ -157,23 +185,32 @@ def main():
         "--overwrite", action="store_true",
         help="รันใหม่แม้ output file จะมีอยู่แล้ว"
     )
+    parser.add_argument(
+        "--output-file", default=None,
+        help="Override output .parquet path (default: {grid-dir}/{stem}_grid.parquet)",
+    )
     args = parser.parse_args()
 
-    polygon_dir = Path(args.polygon_dir)
-    grid_dir    = Path(args.grid_dir)
-
-    if not polygon_dir.exists():
-        raise FileNotFoundError(f"ไม่พบ polygon-dir: {polygon_dir}")
-
+    grid_dir = Path(args.grid_dir)
     grid_dir.mkdir(parents=True, exist_ok=True)
 
-    files = sorted(polygon_dir.glob("*.parquet")) + sorted(polygon_dir.glob("*.gpkg"))
-    if not files:
-        raise FileNotFoundError(f"ไม่พบไฟล์ .parquet หรือ .gpkg ใน {polygon_dir}")
+    output_file = Path(args.output_file) if args.output_file else None
 
-    print(f"พบ {len(files)} polygon file(s)")
-    for f in files:
-        process_polygon_file(f, grid_dir, overwrite=args.overwrite)
+    if args.polygon_file:
+        polygon_path = Path(args.polygon_file)
+        if not polygon_path.exists():
+            raise FileNotFoundError(f"ไม่พบ polygon-file: {polygon_path}")
+        process_polygon_file(polygon_path, grid_dir, overwrite=args.overwrite, output_file=output_file)
+    else:
+        polygon_dir = Path(args.polygon_dir)
+        if not polygon_dir.exists():
+            raise FileNotFoundError(f"ไม่พบ polygon-dir: {polygon_dir}")
+        files = sorted(polygon_dir.glob("*.parquet")) + sorted(polygon_dir.glob("*.gpkg"))
+        if not files:
+            raise FileNotFoundError(f"ไม่พบไฟล์ .parquet หรือ .gpkg ใน {polygon_dir}")
+        print(f"พบ {len(files)} polygon file(s)")
+        for f in files:
+            process_polygon_file(f, grid_dir, overwrite=args.overwrite)
 
     print("=" * 60)
     print("DONE")
